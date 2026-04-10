@@ -27,6 +27,7 @@ embassy-futures = { workspace = true }
 embedded-io = { workspace = true }
 embedded-io-async = { workspace = true }
 embedded-serial = { workspace = true }
+usb-device = "0.3.2"
 embassy-sync = { workspace = true }
 embassy-time = { workspace = true, optional = true }
 embassy-time-driver = { workspace = true, optional = true }
