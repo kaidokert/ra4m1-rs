@@ -452,7 +452,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
                     binding.max_packet,
                     binding.max_packet as u32,
                 );
-                return Err(UsbError::WouldBlock);
+                return Ok(0);
             }
             if dtln > buf.len() {
                 return Err(UsbError::BufferOverflow);

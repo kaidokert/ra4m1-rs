@@ -319,6 +319,7 @@ fn capture_irq_event<I: Instance>() {
     );
 
     let mut captured_intsts0 = pac::usbfs::regs::Intsts0::default();
+    captured_intsts0.set_dvsq(ists0.dvsq());
     captured_intsts0.set_resm(ists0.resm());
     captured_intsts0.set_sofr(ists0.sofr());
     captured_intsts0.set_dvst(ists0.dvst());

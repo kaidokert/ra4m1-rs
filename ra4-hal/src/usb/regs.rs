@@ -127,17 +127,24 @@ pub(super) fn read_cfifo(regs: pac::usbfs::Usbfs, buf: &mut [u8]) {
         return;
     }
 
-    let ptr16 = regs.cfifo().as_ptr() as *const u16;
-    let mut chunks = buf.chunks_exact_mut(2);
-    for chunk in &mut chunks {
-        let word = unsafe { ptr16.read_volatile() }.to_le_bytes();
-        chunk.copy_from_slice(&word);
-    }
+    if regs.cfifosel().read().mbw() {
+        let ptr16 = regs.cfifo().as_ptr() as *const u16;
+        let mut chunks = buf.chunks_exact_mut(2);
+        for chunk in &mut chunks {
+            let word = unsafe { ptr16.read_volatile() }.to_le_bytes();
+            chunk.copy_from_slice(&word);
+        }
 
-    let rem = chunks.into_remainder();
-    if let Some(last) = rem.first_mut() {
-        let word = unsafe { ptr16.read_volatile() }.to_le_bytes();
-        *last = word[0];
+        let rem = chunks.into_remainder();
+        if let Some(last) = rem.first_mut() {
+            let word = unsafe { ptr16.read_volatile() }.to_le_bytes();
+            *last = word[0];
+        }
+    } else {
+        let ptr8 = regs.cfifo().as_ptr() as *const u8;
+        for byte in buf {
+            *byte = unsafe { ptr8.read_volatile() };
+        }
     }
 }
 

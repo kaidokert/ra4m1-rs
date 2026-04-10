@@ -29,7 +29,6 @@ impl UsbIrqEvent {
     pub const fn is_empty(self) -> bool {
         self.intsts0.0 == 0
             && self.intsts1.0 == 0
-            && self.seqno == 0
             && !self.valid_high
             && !self.valid_rising
             && self.brdysts.0 == 0
