@@ -1,13 +1,14 @@
 use core::{
     cell::{Cell, UnsafeCell},
     marker::PhantomData,
-    ptr::{read_volatile, write_volatile},
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
 };
 
 use embassy_hal_internal::interrupt::InterruptExt as _;
 use embassy_hal_internal::{Peri, PeripheralType};
 
+use crate::pac::usbfs::regs::Dcpctr;
+use crate::pac::usbfs::vals::DcpctrPid;
 use crate::{
     event_link::{IcuInterrupt as _, InterruptEvent},
     interrupt::{
@@ -16,8 +17,6 @@ use crate::{
     },
     pac, peripherals,
 };
-use crate::pac::usbfs::regs::Dcpctr;
-use crate::pac::usbfs::vals::DcpctrPid;
 
 use super::{
     regs,
@@ -25,8 +24,6 @@ use super::{
 };
 
 const FORCE_RESET_DELAY_CYCLES: u32 = 480_000;
-const USBFS_BASE: usize = 0x4009_0000;
-const USB_UCKSELC: u16 = 0x0001;
 
 static USB_BRDYENB_SHADOW: AtomicU16 = AtomicU16::new(0);
 static USB_NRDYENB_SHADOW: AtomicU16 = AtomicU16::new(0);
@@ -48,9 +45,7 @@ impl Default for Config {
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + PeripheralType {}
 
-pub(crate) trait SealedInstance {
-    #[allow(dead_code)]
-    const PERIPHERAL: &'static str;
+pub(super) trait SealedInstance {
     const INTERRUPT_EVENT: InterruptEvent;
 
     fn regs() -> pac::usbfs::Usbfs;
@@ -61,7 +56,6 @@ pub(crate) trait SealedInstance {
 
 pub struct Driver<'d, I: Instance> {
     _peri: Peri<'d, I>,
-    _phantom: PhantomData<&'d mut I>,
     irq: Interrupt,
     attached: Cell<bool>,
     irq_enabled: Cell<bool>,
@@ -80,7 +74,6 @@ impl<'d, I: Instance + 'static> Driver<'d, I> {
     ) -> Result<Self, Error> {
         let this = Self {
             _peri: peri,
-            _phantom: PhantomData,
             irq: Int::IRQ,
             attached: Cell::new(false),
             irq_enabled: Cell::new(false),
@@ -127,15 +120,14 @@ impl<'d, I: Instance + 'static> Driver<'d, I> {
 
     pub fn force_reset(&self) -> Result<(), Error> {
         let regs = I::regs();
-        let mut syscfg = regs.syscfg().read().0;
-        syscfg &= !regs::USB_DPRPU;
-        regs.syscfg()
-            .write_value(crate::pac::usbfs::regs::Syscfg(syscfg));
+        let mut syscfg = regs.syscfg().read();
+        syscfg.set_dprpu(false);
+        regs.syscfg().write_value(syscfg);
 
-        syscfg = regs.syscfg().read().0;
-        syscfg &= !(0x0020 | 0x0040);
-        regs.syscfg()
-            .write_value(crate::pac::usbfs::regs::Syscfg(syscfg));
+        let mut syscfg = regs.syscfg().read();
+        syscfg.set_drpd(false);
+        syscfg.set_dcfm(false);
+        regs.syscfg().write_value(syscfg);
 
         regs.dcpcfg().write_value(Default::default());
         let dcpmaxp = regs.dcpmaxp().read().0;
@@ -180,7 +172,7 @@ impl<'d, I: Instance + 'static> Driver<'d, I> {
         Int::IRQ.icu_unpend();
     }
 
-    pub(crate) fn clear_capture_state_static() {
+    pub(super) fn clear_capture_state_static() {
         I::event_pending().store(false, Ordering::Release);
         critical_section::with(|_| unsafe {
             *I::latched_event().get() = UsbIrqEvent::default();
@@ -198,15 +190,15 @@ impl<I: Instance> InterruptHandler<I> {
     }
 }
 
-pub(crate) fn set_brdyenb_shadow(mask: u16) {
+pub(super) fn set_brdyenb_shadow(mask: u16) {
     USB_BRDYENB_SHADOW.store(mask, Ordering::Release);
 }
 
-pub(crate) fn set_nrdyenb_shadow(mask: u16) {
+pub(super) fn set_nrdyenb_shadow(mask: u16) {
     USB_NRDYENB_SHADOW.store(mask, Ordering::Release);
 }
 
-pub(crate) fn set_bempenb_shadow(mask: u16) {
+pub(super) fn set_bempenb_shadow(mask: u16) {
     USB_BEMPENB_SHADOW.store(mask, Ordering::Release);
 }
 
@@ -326,10 +318,14 @@ fn capture_irq_event<I: Instance>() {
             & regs::BRDY_BEMP_MASK,
     );
 
+    let mut captured_intsts0 = pac::usbfs::regs::Intsts0::default();
+    captured_intsts0.set_resm(ists0.resm());
+    captured_intsts0.set_sofr(ists0.sofr());
+    captured_intsts0.set_dvst(ists0.dvst());
+    captured_intsts0.set_ctrt(ists0.ctrt());
+
     let event = UsbIrqEvent {
-        intsts0: pac::usbfs::regs::Intsts0(
-            ists0.0 & (regs::USB_RESM | regs::USB_SOFR | regs::USB_DVST | regs::USB_CTRT),
-        ),
+        intsts0: captured_intsts0,
         intsts1: ists1,
         ctrt_ctsq,
         seqno: local.capture_seqno,
@@ -354,11 +350,6 @@ fn capture_irq_event<I: Instance>() {
 }
 
 fn init_usbfs_registers(regs: pac::usbfs::Usbfs) {
-    unsafe {
-        let ucksel = read_volatile((USBFS_BASE + 0xC4) as *const u16);
-        write_volatile((USBFS_BASE + 0xC4) as *mut u16, ucksel | USB_UCKSELC);
-    }
-
     regs.syscfg().modify(|w| w.set_scke(true));
 
     while !regs.syscfg().read().scke() {}
@@ -393,7 +384,6 @@ unsafe impl Sync for EventCell {}
 impl Instance for peripherals::USBFS {}
 
 impl SealedInstance for peripherals::USBFS {
-    const PERIPHERAL: &'static str = "USBFS";
     const INTERRUPT_EVENT: InterruptEvent = InterruptEvent::UsbfsUsbi;
 
     fn regs() -> pac::usbfs::Usbfs {

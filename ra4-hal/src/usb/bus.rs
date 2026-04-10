@@ -1,6 +1,6 @@
 //! usb-device integration layer.
 
-use core::{cell::RefCell, marker::PhantomData};
+use core::cell::RefCell;
 
 use usb_device::{
     Result as UsbResult, UsbDirection, UsbError,
@@ -16,7 +16,6 @@ use super::{Driver, Instance, UsbIrqEvent, regs};
 
 /// `usb-device` bus adapter over the HAL USB driver.
 pub struct Bus<'d, I: Instance> {
-    _phantom: PhantomData<&'d I>,
     driver: Driver<'d, I>,
     state: RefCell<BusState>,
     events: RefCell<UsbEventSnapshot>,
@@ -26,7 +25,6 @@ impl<'d, I: Instance> Bus<'d, I> {
     /// Creates a new bus adapter around the HAL USB driver.
     pub fn new(driver: Driver<'d, I>) -> Self {
         Self {
-            _phantom: PhantomData,
             driver,
             state: RefCell::new(BusState::default()),
             events: RefCell::new(UsbEventSnapshot::default()),
@@ -68,8 +66,8 @@ impl<'d, I: Instance> Bus<'d, I> {
 
     fn stage_setup_packet(&self, setup_packet: [u8; 8]) {
         let regs = self.regs();
-        if (regs.intsts0().read().0 & regs::USB_VALID) != 0 {
-            regs::clear_intsts0(regs, regs::USB_VALID);
+        if regs.intsts0().read().valid() {
+            regs::clear_valid(regs);
         }
 
         let mut state = self.state.borrow_mut();
@@ -266,10 +264,11 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         let regs = self.regs();
         Driver::<'d, I>::clear_capture_state_static();
 
-        let preserved_syscfg = regs.syscfg().read().0 & (0x0400 | 0x0001 | regs::USB_DPRPU);
+        let preserved_syscfg = regs.syscfg().read().0 & (0x0400 | 0x0001 | 0x0010);
         regs.dvstctr0().write_value(Default::default());
-        regs.dcpctr()
-            .write_value(crate::pac::usbfs::regs::Dcpctr(regs::USB_SQSET));
+        let mut dcpctr = Dcpctr::default();
+        dcpctr.set_sqset(true);
+        regs.dcpctr().write_value(dcpctr);
         regs.brdyenb().write_value(Default::default());
         regs.nrdyenb().write_value(Default::default());
         regs.bempenb().write_value(Default::default());
@@ -304,9 +303,9 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             state.nrdyenb_shadow = 0;
             state.bempenb_shadow = 0;
             let bindings = state.pipe_bindings;
-            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, regs::USB_BRDY0);
-            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, regs::USB_NRDY0, 0);
-            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
+            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, 1u16);
+            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 1u16, 0);
+            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, 1u16);
             *self.events.borrow_mut() = UsbEventSnapshot::default();
             bindings
         };
@@ -387,9 +386,9 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
 
         if state.ep0_last_setup_dir_out && buf.is_empty() {
             regs::clear_bemp0(regs);
-            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, regs::USB_BRDY0);
-            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, regs::USB_NRDY0);
-            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
+            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, 1u16);
+            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, 1u16);
+            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, 1u16);
             regs::set_dcp_pid(regs, DcpctrPid::_01, true);
             state.ep0_last_setup_dir_out = false;
             return Ok(0);
@@ -415,9 +414,9 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         }
 
         if short_packet {
-            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
+            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, 1u16);
         } else {
-            regs::update_bempenb(regs, &mut state.bempenb_shadow, regs::USB_BEMP0, 0);
+            regs::update_bempenb(regs, &mut state.bempenb_shadow, 1u16, 0);
         }
 
         regs::set_dcp_pid(regs, DcpctrPid::_01, false);
@@ -492,9 +491,9 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         if buf.is_empty() {
             let mut state = self.state.borrow_mut();
             regs::clear_bemp0(regs);
-            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, regs::USB_BRDY0);
-            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, regs::USB_NRDY0);
-            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
+            regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, 1u16);
+            regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, 1u16);
+            regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, 1u16);
             regs::set_dcp_pid(regs, DcpctrPid::_01, true);
             return Ok(0);
         }
@@ -564,26 +563,25 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
 
         let regs = self.regs();
         let latched = self.take_event_snapshot();
-        let intsts0 = latched.intsts0.0;
 
-        if (intsts0 & regs::USB_DVST) != 0 {
-            regs::clear_intsts0(regs, regs::USB_DVST);
+        if latched.intsts0.dvst() {
+            regs::clear_dvst(regs);
             if latched.intsts0.dvsq() == Dvsq::_001 {
                 return PollResult::Reset;
             }
         }
 
-        if (intsts0 & regs::USB_SOFR) != 0 {
-            regs::clear_intsts0(regs, regs::USB_SOFR);
+        if latched.intsts0.sofr() {
+            regs::clear_sofr(regs);
         }
 
-        if (intsts0 & regs::USB_RESM) != 0 {
-            regs::clear_intsts0(regs, regs::USB_RESM);
+        if latched.intsts0.resm() {
+            regs::clear_resm(regs);
             return PollResult::Resume;
         }
 
         if latched.nrdysts.0 != 0 {
-            if (latched.nrdysts.0 & regs::USB_NRDY0) != 0 {
+            if latched.nrdysts.nrdy(0) {
                 regs::clear_nrdy0(regs);
             }
 
@@ -630,7 +628,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             }
         }
 
-        let non_ep_bemp = latched.bempsts.0 & !regs::USB_BEMP0;
+        let non_ep_bemp = latched.bempsts.0 & !1u16;
         if non_ep_bemp != 0 {
             let mut state = self.state.borrow_mut();
             for pipe in 1..=9u8 {
@@ -647,13 +645,13 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         }
 
         let ctrt_ctsq = Ctsq::from_bits(latched.ctrt_ctsq as u8);
-        if (intsts0 & regs::USB_CTRT) != 0 {
-            regs::clear_intsts0(regs, regs::USB_CTRT);
+        if latched.intsts0.ctrt() {
+            regs::clear_ctrt(regs);
         }
 
         let queued_setup_ready = latched.setup_valid;
-        let control_setup = !queued_setup_ready
-            && matches!(ctrt_ctsq, Ctsq::_001 | Ctsq::_011 | Ctsq::_101);
+        let control_setup =
+            !queued_setup_ready && matches!(ctrt_ctsq, Ctsq::_001 | Ctsq::_011 | Ctsq::_101);
         let valid_setup = latched.valid_pending;
 
         let ep_setup = if control_setup || valid_setup || queued_setup_ready {
@@ -673,7 +671,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
 
         let brdysts = latched.brdysts.0;
         let mut ep_out = 0u16;
-        if (brdysts & regs::USB_BRDY0) != 0 && ep_setup == 0 {
+        if latched.brdysts.brdy(0) && ep_setup == 0 {
             ep_out |= 1;
         } else if ctrt_ctsq == Ctsq::_010 {
             let mut state = self.state.borrow_mut();
@@ -682,7 +680,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             ep_out |= 1;
         }
 
-        if (brdysts & !regs::USB_BRDY0) != 0 {
+        if (brdysts & !1u16) != 0 {
             let state = self.state.borrow();
             for pipe in 1..=9u8 {
                 let bit = 1u16 << pipe;
@@ -698,7 +696,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             }
         }
 
-        let ep_in_complete = if (latched.bempsts.0 & regs::USB_BEMP0) != 0 {
+        let ep_in_complete = if latched.bempsts.bemp(0) {
             regs::clear_bemp0(regs);
             if self.state.borrow().ep0_short_in_waiting_status {
                 0

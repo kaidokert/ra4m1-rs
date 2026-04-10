@@ -42,7 +42,7 @@ impl UsbIrqEvent {
         Self {
             intsts0: Intsts0(self.intsts0.0 | newer.intsts0.0),
             intsts1: Intsts1(self.intsts1.0 | newer.intsts1.0),
-            ctrt_ctsq: if (newer.intsts0.0 & 0x0800) != 0 {
+            ctrt_ctsq: if newer.intsts0.ctrt() {
                 newer.ctrt_ctsq
             } else {
                 self.ctrt_ctsq
@@ -92,7 +92,7 @@ pub struct UsbEventSnapshot {
 impl UsbEventSnapshot {
     pub fn merge_irq_event(&mut self, event: &UsbIrqEvent) {
         self.intsts0 = Intsts0(self.intsts0.0 | event.intsts0.0);
-        if (event.intsts0.0 & 0x0800) != 0 {
+        if event.intsts0.ctrt() {
             self.ctrt_ctsq = event.ctrt_ctsq;
         }
         self.brdysts = Brdysts(self.brdysts.0 | event.brdysts.0);
