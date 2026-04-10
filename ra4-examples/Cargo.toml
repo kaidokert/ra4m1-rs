@@ -40,6 +40,8 @@ uno-r4wifi-bsc = { path = "../uno-r4wifi-bsc" }
 atomic_float = { version = "1.1.0", default-features = false }
 heapless = { version = "0.9.2" }
 micromath = "2.1"
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
 # For a signal generator micromath isn't precise enough but libm adds +10K
 libm = "0.2.16"
 

@@ -25,6 +25,7 @@ pub mod qdec;
 #[cfg(feature = "_enable-rtc-beware-of-dragons")]
 pub mod rtc;
 pub mod timer;
+pub mod usb;
 pub mod watchdog;
 // pub mod sce5;
 pub mod spi;
