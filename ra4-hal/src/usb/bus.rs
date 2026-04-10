@@ -793,6 +793,11 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
     }
 }
 
+// SAFETY: `usb-device` requires `UsbBus: Sync`, but this implementation only
+// targets the single-core MCU execution model used by the HAL. Access to the
+// `RefCell` state inside `Bus` is expected to be serialized by the USB stack's
+// call pattern and by ISR/mainline coordination on that single core; it is not
+// intended for true multi-threaded concurrent access across CPUs.
 unsafe impl<'d, I: Instance> Sync for Bus<'d, I> {}
 
 fn max_packet_for_pipe(ep_type: EndpointType, pipe: u8, requested: u16) -> UsbResult<u16> {
