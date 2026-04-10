@@ -379,6 +379,23 @@ impl<'d, I: Instance> BufferedUart<'d, I> {
     fn set_baud_from_entry(speed: &SpeedEntry) {
         let sci = I::regs();
 
+        #[cfg(feature = "hoco_48mhz")]
+        if speed.baud == 115_200 {
+            // Match the proven raw SCI0 48 MHz / 115200 configuration used by the PAC-based demo.
+            sci.brr().write_value(50);
+            sci.mddr().write_value(188);
+            sci.semr().modify(|r| {
+                r.set_brme(true);
+                r.set_abcse(true);
+                r.set_abcs(false);
+                r.set_bgdm(false);
+                r.set_rxdesel(true);
+            });
+            sci.smr().modify(|r| r.set_cks(SmrCks::from_bits(0)));
+            sci.scr().modify(|r| r.set_re(true));
+            return;
+        }
+
         sci.brr().write_value(speed.big_n);
 
         if speed.modulation != 0 {
@@ -464,6 +481,10 @@ impl<'d, I: Instance> BufferedUart<'d, I> {
             r.set_fm(true);
             // TODO: Is this the value we want?
             r.set_ttrg(I::FIFO_DEPTH);
+            // Force RX interrupts at the lowest threshold. Without this,
+            // SCI0/SCI1 can sit on short RX bursts and never wake the
+            // ring-buffer path used by BufferedUart::blocking_read().
+            r.set_rtrg(crate::pac::sci::vals::Rtrg::_0000);
         });
 
         // TODO: Give enum variants meaningful names.
@@ -493,7 +514,7 @@ impl<'d, I: Instance> BufferedUart<'d, I> {
         });
 
         sci.sptr().write(|r| {
-            r.set_spb2dt(false);
+            r.set_spb2dt(true);
             r.set_spb2io(false);
         });
 
@@ -701,31 +722,30 @@ impl<'d, I: Instance> BufferedUart<'d, I> {
     pub fn blocking_write(&mut self, data: &[u8]) {
         let sci = I::regs();
 
-        let mut written: usize = 0;
-        let mut tx_writer = unsafe { I::tx_buffer().writer() };
-
-        while written != data.len() {
-            let out_slice = tx_writer.push_slice();
-            if !out_slice.is_empty() {
-                let n = out_slice.len().min(data.len() - written);
-                out_slice[..n].copy_from_slice(&data[written..written + n]);
-                written += n;
-                tx_writer.push_done(n);
-            } else {
-                self.tx_int.icu_pend();
-            }
-
-            if !sci.scr().read().te() {
                 sci.scr().modify(|r| {
                     r.set_te(true);
-                    r.set_tie(true);
+            r.set_tie(false);
+            r.set_teie(false);
                 });
+
+        for &byte in data {
+            while !sci.ssr_fifo().read().tdfe() {
+                asm::nop();
             }
+
+            sci.ftdrl().write_value(byte);
         }
 
         while !sci.ssr_fifo().read().tend() {
             asm::nop();
         }
+
+        sci.scr().modify(|r| {
+            r.set_te(false);
+            r.set_tie(false);
+            r.set_teie(false);
+        });
+
     }
 }
 
