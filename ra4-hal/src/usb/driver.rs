@@ -16,6 +16,8 @@ use crate::{
     },
     pac, peripherals,
 };
+use crate::pac::usbfs::regs::Dcpctr;
+use crate::pac::usbfs::vals::DcpctrPid;
 
 use super::{
     regs,
@@ -139,9 +141,10 @@ impl<'d, I: Instance + 'static> Driver<'d, I> {
         let dcpmaxp = regs.dcpmaxp().read().0;
         regs.dcpmaxp()
             .write_value(crate::pac::usbfs::regs::Dcpmaxp(dcpmaxp));
-        regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-            regs::USB_SQCLR | regs::USB_PID_NAK,
-        ));
+        let mut dcpctr = Dcpctr::default();
+        dcpctr.set_sqclr(true);
+        dcpctr.set_pid(DcpctrPid::_00);
+        regs.dcpctr().write_value(dcpctr);
 
         cortex_m::asm::delay(FORCE_RESET_DELAY_CYCLES);
         self.attach();

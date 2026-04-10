@@ -3,38 +3,20 @@
 use usb_device::{UsbDirection, endpoint::EndpointType};
 
 use crate::pac::{self, usbfs::regs::*};
+use crate::pac::usbfs::vals::{
+    CfifoselCurpipe, D0fifoselCurpipe, DcpctrPid, Pipectr2Pid, PipectrPid, Type,
+};
 
 use super::driver::{set_bempenb_shadow, set_brdyenb_shadow, set_nrdyenb_shadow};
 use super::types::PipeBinding;
 
 pub(crate) const USB_DPRPU: u16 = 0x0010;
-pub(crate) const USB_ISEL: u16 = 0x0020;
-pub(crate) const USB_MBW_8: u16 = 0x0000;
-pub(crate) const USB_MBW_16: u16 = 0x0400;
-pub(crate) const USB_RCNT: u16 = 0x8000;
-pub(crate) const USB_BVAL: u16 = 0x8000;
-pub(crate) const USB_BCLR: u16 = 0x4000;
-pub(crate) const USB_FRDY: u16 = 0x2000;
-pub(crate) const USB_DTLN: u16 = 0x0fff;
 pub(crate) const USB_BRDY0: u16 = 0x0001;
 pub(crate) const USB_NRDY0: u16 = 0x0001;
 pub(crate) const USB_BEMP0: u16 = 0x0001;
-pub(crate) const USB_PIPECFG_BULK: u16 = 0x4000;
-pub(crate) const USB_PIPECFG_INTERRUPT: u16 = 0x8000;
-pub(crate) const USB_PIPECFG_DBLBON: u16 = 0x0200;
-pub(crate) const USB_PIPECFG_BFREON: u16 = 0x0400;
-pub(crate) const USB_PIPECFG_SHTNAK: u16 = 0x0080;
-pub(crate) const USB_PIPECFG_DIR_IN: u16 = 0x0010;
-pub(crate) const USB_SQCLR: u16 = 0x0100;
 pub(crate) const USB_SQSET: u16 = 0x0080;
 pub(crate) const USB_ACLRM: u16 = 0x0200;
 pub(crate) const USB_CSCLR: u16 = 0x2000;
-pub(crate) const USB_CCPL: u16 = 0x0004;
-pub(crate) const USB_PID_MASK: u16 = 0x0003;
-pub(crate) const USB_PID_STALL: u16 = 0x0002;
-pub(crate) const USB_PID_BUF: u16 = 0x0001;
-pub(crate) const USB_PID_NAK: u16 = 0x0000;
-pub(crate) const USB_PBUSY: u16 = 0x0020;
 pub(crate) const USB_RESM: u16 = 0x4000;
 pub(crate) const USB_SOFR: u16 = 0x2000;
 pub(crate) const USB_DVST: u16 = 0x1000;
@@ -51,22 +33,27 @@ pub(crate) const BRDY_BEMP_MASK: u16 = 0x03ff;
 pub(crate) const CFIFO_READY_SPINS: usize = 10_000;
 pub(crate) const PIPE0_READY_ATTEMPTS: usize = 8;
 
+#[derive(Clone, Copy)]
+pub(crate) enum PipePid {
+    Nak,
+    Buf,
+}
+
 #[inline(always)]
 pub(crate) fn usbfs() -> pac::usbfs::Usbfs {
     pac::USBFS
 }
 
 pub(crate) fn select_pipe0(regs: pac::usbfs::Usbfs, in_direction: bool) {
-    let mut value = USB_MBW_8;
-    if in_direction {
-        value |= USB_ISEL;
-    }
-    regs.cfifosel().write_value(Cfifosel(value));
+    let mut value = Cfifosel::default();
+    value.set_mbw(false);
+    value.set_isel(in_direction);
+    value.set_rcnt(false);
+    regs.cfifosel().write_value(value);
 
     for _ in 0..CFIFO_READY_SPINS {
-        let fifosel = regs.cfifosel().read().0;
-        let expected = value & (USB_ISEL | USB_RCNT);
-        if (fifosel & (USB_ISEL | USB_RCNT)) == expected {
+        let fifosel = regs.cfifosel().read();
+        if fifosel.isel() == in_direction && !fifosel.rcnt() && !fifosel.mbw() {
             return;
         }
     }
@@ -78,30 +65,33 @@ pub(crate) fn select_cfifo(
     in_direction: bool,
     read_count: bool,
 ) {
-    let mut value = USB_MBW_16 | pipe as u16;
-    if in_direction {
-        value |= USB_ISEL;
-    }
-    if read_count {
-        value |= USB_RCNT;
-    }
-    regs.cfifosel().write_value(Cfifosel(value));
+    let mut value = Cfifosel::default();
+    value.set_curpipe(CfifoselCurpipe::from_bits(pipe));
+    value.set_mbw(true);
+    value.set_isel(in_direction);
+    value.set_rcnt(read_count);
+    regs.cfifosel().write_value(value);
 
     for _ in 0..CFIFO_READY_SPINS {
-        let fifosel = regs.cfifosel().read().0;
-        let expected = value & (0x000f | USB_ISEL | USB_RCNT);
-        if (fifosel & (0x000f | USB_ISEL | USB_RCNT)) == expected {
+        let fifosel = regs.cfifosel().read();
+        if fifosel.curpipe().to_bits() == pipe
+            && fifosel.isel() == in_direction
+            && fifosel.rcnt() == read_count
+            && fifosel.mbw()
+        {
             return;
         }
     }
 }
 
 pub(crate) fn select_d0fifo(regs: pac::usbfs::Usbfs, pipe: u8) {
-    let expected = USB_MBW_16 | pipe as u16;
-    regs.d0fifosel().write_value(D0fifosel(expected));
+    let mut expected = D0fifosel::default();
+    expected.set_curpipe(D0fifoselCurpipe::from_bits(pipe));
+    expected.set_mbw(true);
+    regs.d0fifosel().write_value(expected);
     for _ in 0..CFIFO_READY_SPINS {
-        let fifosel = regs.d0fifosel().read().0;
-        if (fifosel & (0x000f | USB_MBW_16)) == expected {
+        let fifosel = regs.d0fifosel().read();
+        if fifosel.curpipe().to_bits() == pipe && fifosel.mbw() {
             return;
         }
     }
@@ -109,7 +99,7 @@ pub(crate) fn select_d0fifo(regs: pac::usbfs::Usbfs, pipe: u8) {
 
 pub(crate) fn cfifo_ready(regs: pac::usbfs::Usbfs) -> bool {
     for _ in 0..CFIFO_READY_SPINS {
-        if (regs.cfifoctr().read().0 & USB_FRDY) != 0 {
+        if regs.cfifoctr().read().frdy() {
             return true;
         }
 
@@ -133,7 +123,7 @@ pub(crate) fn select_pipe0_ready(regs: pac::usbfs::Usbfs, in_direction: bool) ->
 
 pub(crate) fn d0fifo_ready(regs: pac::usbfs::Usbfs) -> bool {
     for _ in 0..CFIFO_READY_SPINS {
-        if (regs.d0fifoctr().read().0 & USB_FRDY) != 0 {
+        if regs.d0fifoctr().read().frdy() {
             return true;
         }
 
@@ -176,16 +166,46 @@ pub(crate) fn write_d0fifo(regs: pac::usbfs::Usbfs, buf: &[u8]) {
     }
 
     let fifosel = regs.d0fifosel().read().0;
-    regs.d0fifosel()
-        .write_value(D0fifosel((fifosel & !0x0c00) | USB_MBW_8));
+    let mut d0fifosel = D0fifosel(fifosel);
+    d0fifosel.set_mbw(false);
+    regs.d0fifosel().write_value(d0fifosel);
 
     let ptr8 = regs.d0fifo().as_ptr() as *mut u8;
     for &byte in buf {
         unsafe { ptr8.write_volatile(byte) };
     }
 
-    regs.d0fifosel()
-        .write_value(D0fifosel((fifosel & !0x0c00) | USB_MBW_16));
+    let mut d0fifosel = D0fifosel(fifosel);
+    d0fifosel.set_mbw(true);
+    regs.d0fifosel().write_value(d0fifosel);
+}
+
+pub(crate) fn clear_d0fifo_buffer(regs: pac::usbfs::Usbfs) {
+    let mut ctr = D0fifoctr::default();
+    ctr.set_bclr(true);
+    regs.d0fifoctr().write_value(ctr);
+}
+
+pub(crate) fn set_d0fifo_bval(regs: pac::usbfs::Usbfs) {
+    let mut ctr = D0fifoctr::default();
+    ctr.set_bval(true);
+    regs.d0fifoctr().write_value(ctr);
+}
+
+pub(crate) fn clear_cfifo_buffer(regs: pac::usbfs::Usbfs) {
+    let mut ctr = Cfifoctr::default();
+    ctr.set_bclr(true);
+    regs.cfifoctr().write_value(ctr);
+}
+
+pub(crate) fn set_cfifo_bval(regs: pac::usbfs::Usbfs) {
+    let mut ctr = Cfifoctr::default();
+    ctr.set_bval(true);
+    regs.cfifoctr().write_value(ctr);
+}
+
+pub(crate) fn cfifo_dtln(regs: pac::usbfs::Usbfs) -> usize {
+    regs.cfifoctr().read().dtln() as usize
 }
 
 pub(crate) fn clear_intsts0(regs: pac::usbfs::Usbfs, mask: u16) {
@@ -279,6 +299,73 @@ pub(crate) fn read_pipectr(pipe: u8) -> u16 {
     }
 }
 
+pub(crate) fn pipe_busy(pipe: u8) -> bool {
+    let regs = usbfs();
+    match pipe {
+        1..=5 => regs.pipectr((pipe - 1) as usize).read().pbusy(),
+        6..=9 => regs.pipectr2((pipe - 6) as usize).read().pbusy(),
+        _ => false,
+    }
+}
+
+pub(crate) fn set_pipe_pid(pipe: u8, pid: PipePid) {
+    let regs = usbfs();
+    match pipe {
+        1..=5 => {
+            let mut ctr = regs.pipectr((pipe - 1) as usize).read();
+            ctr.set_pid(match pid {
+                PipePid::Nak => PipectrPid::_00,
+                PipePid::Buf => PipectrPid::_01,
+            });
+            regs.pipectr((pipe - 1) as usize).write_value(ctr);
+        }
+        6..=9 => {
+            let mut ctr = regs.pipectr2((pipe - 6) as usize).read();
+            ctr.set_pid(match pid {
+                PipePid::Nak => Pipectr2Pid::_00,
+                PipePid::Buf => Pipectr2Pid::_01,
+            });
+            regs.pipectr2((pipe - 6) as usize).write_value(ctr);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn pipe_pid_is_buf(pipe: u8) -> bool {
+    let regs = usbfs();
+    match pipe {
+        1..=5 => regs.pipectr((pipe - 1) as usize).read().pid() == PipectrPid::_01,
+        6..=9 => regs.pipectr2((pipe - 6) as usize).read().pid() == Pipectr2Pid::_01,
+        _ => false,
+    }
+}
+
+pub(crate) fn reset_pipe_ctr(pipe: u8) {
+    let regs = usbfs();
+    match pipe {
+        1..=5 => {
+            let mut ctr = Pipectr::default();
+            ctr.set_sqclr(true);
+            ctr.set_pid(PipectrPid::_00);
+            regs.pipectr((pipe - 1) as usize).write_value(ctr);
+        }
+        6..=9 => {
+            let mut ctr = Pipectr2::default();
+            ctr.set_sqclr(true);
+            ctr.set_pid(Pipectr2Pid::_00);
+            regs.pipectr2((pipe - 6) as usize).write_value(ctr);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn set_dcp_pid(regs: pac::usbfs::Usbfs, pid: DcpctrPid, ccpl: bool) {
+    let mut dcpctr = regs.dcpctr().read();
+    dcpctr.set_pid(pid);
+    dcpctr.set_ccpl(ccpl);
+    regs.dcpctr().write_value(dcpctr);
+}
+
 pub(crate) fn write_pipectr(pipe: u8, value: u16) {
     write_pipectr_reason(pipe, value, 0);
 }
@@ -313,13 +400,14 @@ pub(crate) fn pulse_pipectr_bits(pipe: u8, bits: u16) {
 }
 
 pub(crate) fn set_pipe_nak_wait(pipe: u8) {
-    let current = read_pipectr(pipe);
     // Match Renesas usb_cstd_set_nak(): clear BUF first, then wait for PBUSY to drop.
-    write_pipectr_reason(pipe, current & !USB_PID_BUF, 1);
+    if !(1..=9).contains(&pipe) {
+        return;
+    }
+    set_pipe_pid(pipe, PipePid::Nak);
 
     for _ in 0..CFIFO_READY_SPINS {
-        let current = read_pipectr(pipe);
-        if (current & USB_PBUSY) == 0 {
+        if !pipe_busy(pipe) {
             return;
         }
     }
@@ -334,38 +422,29 @@ pub(crate) fn configure_pipe(
     binding: PipeBinding,
 ) {
     let pipe_type = match binding.ep_type {
-        EndpointType::Bulk => USB_PIPECFG_BULK | USB_PIPECFG_DBLBON,
-        EndpointType::Interrupt => USB_PIPECFG_INTERRUPT,
+        EndpointType::Bulk => Type::_01,
+        EndpointType::Interrupt => Type::_10,
         _ => return,
-    };
-    let pipe_dir = if binding.ep_addr.direction() == UsbDirection::In {
-        USB_PIPECFG_DIR_IN
-    } else {
-        0
     };
 
     set_pipe_nak_wait(pipe);
     regs.pipesel().write_value(Pipesel(pipe as u16));
-    let bf_re = if binding.ep_addr.direction() == UsbDirection::Out {
-        0
-    } else {
-        USB_PIPECFG_BFREON
-    };
-    let out_rx_mode = if binding.ep_addr.direction() == UsbDirection::Out
-        && matches!(binding.ep_type, EndpointType::Bulk)
-    {
-        USB_PIPECFG_SHTNAK
-    } else {
-        0
-    };
-    regs.pipecfg().write_value(Pipecfg(
-        bf_re | out_rx_mode | pipe_type | pipe_dir | binding.ep_addr.index() as u16,
-    ));
+    let mut pipecfg = Pipecfg::default();
+    pipecfg.set_epnum(binding.ep_addr.index() as u8);
+    pipecfg.set_dir(binding.ep_addr.direction() == UsbDirection::In);
+    pipecfg.set_type_(pipe_type);
+    pipecfg.set_dblb(matches!(binding.ep_type, EndpointType::Bulk));
+    pipecfg.set_bfre(binding.ep_addr.direction() == UsbDirection::In);
+    pipecfg.set_shtnak(
+        binding.ep_addr.direction() == UsbDirection::Out
+            && matches!(binding.ep_type, EndpointType::Bulk),
+    );
+    regs.pipecfg().write_value(pipecfg);
     regs.pipemaxp()
         .write_value(Pipemaxp(binding.max_packet & 0x01ff));
     regs.pipeperi().write_value(Pipeperi(0));
     regs.pipesel().write_value(Pipesel(0));
-    write_pipectr_reason(pipe, USB_SQCLR | USB_PID_NAK, 3);
+    reset_pipe_ctr(pipe);
     set_pipectr_bits(pipe, USB_CSCLR);
     pulse_pipectr_bits(pipe, USB_ACLRM);
     clear_brdy(regs, pipe);
@@ -390,7 +469,7 @@ pub(crate) fn clear_pipe_config(regs: pac::usbfs::Usbfs, pipe: u8) {
     regs.pipemaxp().write_value(Pipemaxp(0));
     regs.pipeperi().write_value(Pipeperi(0));
     regs.pipesel().write_value(Pipesel(0));
-    write_pipectr_reason(pipe, USB_SQCLR | USB_PID_NAK, 4);
+    reset_pipe_ctr(pipe);
     set_pipectr_bits(pipe, USB_CSCLR);
     pulse_pipectr_bits(pipe, USB_ACLRM);
     clear_brdy(regs, pipe);
@@ -415,8 +494,7 @@ pub(crate) fn start_out_receive(
     select_cfifo(regs, pipe, false, false);
     clear_brdy(regs, pipe);
     clear_nrdy(regs, pipe);
-    let current = read_pipectr(pipe);
-    write_pipectr_reason(pipe, (current & !USB_PID_MASK) | USB_PID_BUF, 5);
+    set_pipe_pid(pipe, PipePid::Buf);
     write_brdyenb(regs, brdyenb_shadow, *brdyenb_shadow | bit);
     write_nrdyenb(regs, nrdyenb_shadow, *nrdyenb_shadow | bit);
 }

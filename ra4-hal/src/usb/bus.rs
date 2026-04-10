@@ -8,6 +8,9 @@ use usb_device::{
     endpoint::{EndpointAddress, EndpointType},
 };
 
+use crate::pac::usbfs::regs::{Cfifosel, D0fifosel, D1fifosel, Dcpctr};
+use crate::pac::usbfs::vals::DcpctrPid;
+
 use super::types::{BusState, PipeBinding, UsbEventSnapshot};
 use super::{Driver, Instance, UsbIrqEvent, regs};
 
@@ -278,12 +281,15 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         regs.dcpcfg().write_value(Default::default());
         regs.dcpmaxp()
             .write_value(crate::pac::usbfs::regs::Dcpmaxp(self.ep0_size()));
-        regs.cfifosel()
-            .write_value(crate::pac::usbfs::regs::Cfifosel(regs::USB_MBW_8));
-        regs.d0fifosel()
-            .write_value(crate::pac::usbfs::regs::D0fifosel(regs::USB_MBW_16));
-        regs.d1fifosel()
-            .write_value(crate::pac::usbfs::regs::D1fifosel(regs::USB_MBW_8));
+        let mut cfifosel = Cfifosel::default();
+        cfifosel.set_mbw(false);
+        regs.cfifosel().write_value(cfifosel);
+        let mut d0fifosel = D0fifosel::default();
+        d0fifosel.set_mbw(true);
+        regs.d0fifosel().write_value(d0fifosel);
+        let mut d1fifosel = D1fifosel::default();
+        d1fifosel.set_mbw(false);
+        regs.d1fifosel().write_value(d1fifosel);
 
         let pipe_bindings = {
             let mut state = self.state.borrow_mut();
@@ -305,9 +311,10 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             bindings
         };
 
-        regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-            regs::USB_SQCLR | regs::USB_PID_NAK,
-        ));
+        let mut dcpctr = Dcpctr::default();
+        dcpctr.set_sqclr(true);
+        dcpctr.set_pid(DcpctrPid::_00);
+        regs.dcpctr().write_value(dcpctr);
 
         for pipe in 1..=9u8 {
             regs::clear_pipe_config(regs, pipe);
@@ -354,29 +361,17 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             }
 
             let mut state = self.state.borrow_mut();
-            let current = regs::read_pipectr(pipe);
-            regs::write_pipectr_reason(
-                pipe,
-                (current & !regs::USB_PID_MASK) | regs::USB_PID_NAK,
-                16,
-            );
+            regs::set_pipe_pid(pipe, regs::PipePid::Nak);
             regs::clear_bemp(regs, pipe);
-            regs.d0fifoctr()
-                .write_value(crate::pac::usbfs::regs::D0fifoctr(regs::USB_BCLR));
+            regs::clear_d0fifo_buffer(regs);
             regs::write_d0fifo(regs, &buf[..write_len]);
 
             if write_len == 0 || write_len < binding.max_packet as usize {
-                regs.d0fifoctr()
-                    .write_value(crate::pac::usbfs::regs::D0fifoctr(regs::USB_BVAL));
+                regs::set_d0fifo_bval(regs);
             }
 
             regs::update_bempenb(regs, &mut state.bempenb_shadow, 1u16 << pipe, 0);
-            let current = regs::read_pipectr(pipe);
-            regs::write_pipectr_reason(
-                pipe,
-                (current & !regs::USB_PID_MASK) | regs::USB_PID_BUF,
-                17,
-            );
+            regs::set_pipe_pid(pipe, regs::PipePid::Buf);
             state.in_busy_mask |= 1u16 << pipe;
             return Ok(write_len);
         }
@@ -395,10 +390,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, regs::USB_BRDY0);
             regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, regs::USB_NRDY0);
             regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
-            let dcpctr = regs.dcpctr().read().0;
-            regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-                (dcpctr & !regs::USB_PID_MASK) | regs::USB_CCPL | regs::USB_PID_BUF,
-            ));
+            regs::set_dcp_pid(regs, DcpctrPid::_01, true);
             state.ep0_last_setup_dir_out = false;
             return Ok(0);
         }
@@ -409,22 +401,17 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             return Err(UsbError::WouldBlock);
         }
 
-        regs.cfifoctr()
-            .write_value(crate::pac::usbfs::regs::Cfifoctr(regs::USB_BCLR));
+        regs::clear_cfifo_buffer(regs);
 
         let ep0_max_packet = self.ep0_size() as usize;
         let mut state = self.state.borrow_mut();
-        let dcpctr = regs.dcpctr().read().0;
-        regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-            (dcpctr & !regs::USB_PID_MASK) | regs::USB_PID_NAK,
-        ));
+        regs::set_dcp_pid(regs, DcpctrPid::_00, false);
         regs::clear_bemp0(regs);
         regs::write_cfifo(regs, buf);
 
         let short_packet = buf.len() < ep0_max_packet;
         if buf.is_empty() || short_packet {
-            regs.cfifoctr()
-                .write_value(crate::pac::usbfs::regs::Cfifoctr(regs::USB_BVAL));
+            regs::set_cfifo_bval(regs);
         }
 
         if short_packet {
@@ -433,10 +420,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             regs::update_bempenb(regs, &mut state.bempenb_shadow, regs::USB_BEMP0, 0);
         }
 
-        let current = regs.dcpctr().read().0;
-        regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-            (current & !regs::USB_PID_MASK) | regs::USB_PID_BUF,
-        ));
+        regs::set_dcp_pid(regs, DcpctrPid::_01, false);
         state.ep0_short_in_waiting_status = short_packet;
         Ok(buf.len())
     }
@@ -458,11 +442,9 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
                 return Err(UsbError::WouldBlock);
             }
 
-            let fifoctr = regs.cfifoctr().read().0;
-            let dtln = (fifoctr & regs::USB_DTLN) as usize;
+            let dtln = regs::cfifo_dtln(regs);
             if dtln == 0 {
-                regs.cfifoctr()
-                    .write_value(crate::pac::usbfs::regs::Cfifoctr(regs::USB_BCLR));
+                regs::clear_cfifo_buffer(regs);
                 regs::clear_brdy(regs, pipe);
                 let mut state = self.state.borrow_mut();
                 self.start_out_receive_in_state(
@@ -478,8 +460,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             }
 
             regs::read_cfifo(regs, &mut buf[..dtln]);
-            regs.cfifoctr()
-                .write_value(crate::pac::usbfs::regs::Cfifoctr(regs::USB_BCLR));
+            regs::clear_cfifo_buffer(regs);
             regs::clear_brdy(regs, pipe);
             let mut state = self.state.borrow_mut();
             self.start_out_receive_in_state(
@@ -514,10 +495,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             regs::update_brdyenb(regs, &mut state.brdyenb_shadow, 0, regs::USB_BRDY0);
             regs::update_nrdyenb(regs, &mut state.nrdyenb_shadow, 0, regs::USB_NRDY0);
             regs::update_bempenb(regs, &mut state.bempenb_shadow, 0, regs::USB_BEMP0);
-            let dcpctr = regs.dcpctr().read().0;
-            regs.dcpctr().write_value(crate::pac::usbfs::regs::Dcpctr(
-                (dcpctr & !regs::USB_PID_MASK) | regs::USB_CCPL | regs::USB_PID_BUF,
-            ));
+            regs::set_dcp_pid(regs, DcpctrPid::_01, true);
             return Ok(0);
         }
 
@@ -525,14 +503,12 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             return Err(UsbError::WouldBlock);
         }
 
-        let fifoctr = regs.cfifoctr().read().0;
-        let dtln = (fifoctr & regs::USB_DTLN) as usize;
+        let dtln = regs::cfifo_dtln(regs);
         if dtln > buf.len() {
             return Err(UsbError::BufferOverflow);
         }
         if dtln == 0 {
-            regs.cfifoctr()
-                .write_value(crate::pac::usbfs::regs::Cfifoctr(regs::USB_BCLR));
+            regs::clear_cfifo_buffer(regs);
             regs::clear_brdy0(regs);
             return Ok(0);
         }
@@ -548,26 +524,21 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         }
 
         let regs = self.regs();
-        let current = regs.dcpctr().read().0;
         let live_ctsq = regs.intsts0().read().0 & regs::USB_CTSQ;
         let next_pid = if stalled {
-            regs::USB_PID_STALL
+            DcpctrPid::_10
         } else if live_ctsq == regs::USB_CS_RDDS || live_ctsq == regs::USB_CS_RDSS {
-            regs::USB_PID_BUF
+            DcpctrPid::_01
         } else {
-            regs::USB_PID_NAK
+            DcpctrPid::_00
         };
-        let next = (current & !regs::USB_PID_MASK) | next_pid;
-        let extra = if stalled || next_pid == regs::USB_PID_BUF {
-            0
-        } else {
-            regs::USB_SQCLR
-        };
-        regs.dcpctr()
-            .write_value(crate::pac::usbfs::regs::Dcpctr(next | extra));
+        let mut dcpctr = regs.dcpctr().read();
+        dcpctr.set_pid(next_pid);
+        dcpctr.set_sqclr(!stalled && next_pid != DcpctrPid::_01);
+        regs.dcpctr().write_value(dcpctr);
 
         let mut state = self.state.borrow_mut();
-        if !stalled && next_pid == regs::USB_PID_BUF && live_ctsq == regs::USB_CS_RDDS {
+        if !stalled && next_pid == DcpctrPid::_01 && live_ctsq == regs::USB_CS_RDDS {
             state.ep0_expect_status_out = true;
         }
         state.ep0_stalled = stalled;
@@ -630,15 +601,8 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
                     continue;
                 }
 
-                let current = regs::read_pipectr(pipe);
-                if (current & regs::USB_PID_MASK) != regs::USB_PID_BUF
-                    && (current & regs::USB_PBUSY) == 0
-                {
-                    regs::write_pipectr_reason(
-                        pipe,
-                        (current & !regs::USB_PID_MASK) | regs::USB_PID_BUF,
-                        19,
-                    );
+                if !regs::pipe_pid_is_buf(pipe) && !regs::pipe_busy(pipe) {
+                    regs::set_pipe_pid(pipe, regs::PipePid::Buf);
                 }
             }
         }
@@ -653,10 +617,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
                     continue;
                 }
 
-                let current = regs::read_pipectr(pipe);
-                let pid = current & regs::USB_PID_MASK;
-                let busy = (current & regs::USB_PBUSY) != 0;
-                if pid == regs::USB_PID_BUF || busy {
+                if regs::pipe_pid_is_buf(pipe) || regs::pipe_busy(pipe) {
                     continue;
                 }
 
@@ -680,12 +641,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
                 regs::clear_bemp(regs, pipe);
                 let next_bemp = state.bempenb_shadow & !bit;
                 self.write_bempenb_in_state(&mut state, next_bemp);
-                let current = regs::read_pipectr(pipe);
-                regs::write_pipectr_reason(
-                    pipe,
-                    (current & !regs::USB_PID_MASK) | regs::USB_PID_NAK,
-                    18,
-                );
+                regs::set_pipe_pid(pipe, regs::PipePid::Nak);
                 state.in_busy_mask &= !bit;
             }
         }
