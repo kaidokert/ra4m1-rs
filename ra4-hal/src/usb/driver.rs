@@ -119,6 +119,8 @@ impl<'d, I: Instance + 'static> Driver<'d, I> {
     }
 
     pub fn force_reset(&self) -> Result<(), Error> {
+        Self::clear_capture_state_static();
+
         let regs = I::regs();
         let mut syscfg = regs.syscfg().read();
         syscfg.set_dprpu(false);
@@ -273,7 +275,7 @@ fn capture_irq_event<I: Instance>() {
     let ists1 = pac::usbfs::regs::Intsts1(intsts1.0 & intenb1.0);
 
     let ctrt_ctsq = if ists0.ctrt() {
-        regs.intsts0().read().ctsq().to_bits() as u16
+        intsts0.ctsq().to_bits() as u16
     } else {
         0
     };

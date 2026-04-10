@@ -297,9 +297,12 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         let pipe_bindings = {
             let mut state = self.state.borrow_mut();
             state.ep0_stalled = false;
+            state.stalled_in_mask = 0;
+            state.stalled_out_mask = 0;
             state.ep0_short_in_waiting_status = false;
             state.ep0_setup_pending = false;
             state.ep0_setup_ready = false;
+            state.ep0_last_setup_dir_out = false;
             state.ep0_expect_status_out = false;
             state.suspended = false;
             state.in_busy_mask = 0;
@@ -319,11 +322,22 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         dcpctr.set_pid(DcpctrPid::_00);
         regs.dcpctr().write_value(dcpctr);
 
-        for pipe in 1..=9u8 {
-            regs::clear_pipe_config(regs, pipe);
-        }
-
         let mut state = self.state.borrow_mut();
+        let mut brdyenb_shadow = state.brdyenb_shadow;
+        let mut nrdyenb_shadow = state.nrdyenb_shadow;
+        let mut bempenb_shadow = state.bempenb_shadow;
+        for pipe in 1..=9u8 {
+            regs::clear_pipe_config(
+                regs,
+                &mut brdyenb_shadow,
+                &mut nrdyenb_shadow,
+                &mut bempenb_shadow,
+                pipe,
+            );
+        }
+        state.brdyenb_shadow = brdyenb_shadow;
+        state.nrdyenb_shadow = nrdyenb_shadow;
+        state.bempenb_shadow = bempenb_shadow;
         for (pipe, binding) in pipe_bindings.iter().enumerate().skip(1) {
             if let Some(binding) = binding {
                 self.configure_pipe_in_state(&mut state, pipe as u8, *binding);
@@ -407,13 +421,14 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         regs::clear_cfifo_buffer(regs);
 
         let ep0_max_packet = self.ep0_size() as usize;
+        let write_len = buf.len().min(ep0_max_packet);
         let mut state = self.state.borrow_mut();
         regs::set_dcp_pid(regs, DcpctrPid::_00, false);
         regs::clear_bemp0(regs);
-        regs::write_cfifo(regs, buf);
+        regs::write_cfifo(regs, &buf[..write_len]);
 
-        let short_packet = buf.len() < ep0_max_packet;
-        if buf.is_empty() || short_packet {
+        let short_packet = write_len < ep0_max_packet;
+        if write_len == 0 || short_packet {
             regs::set_cfifo_bval(regs);
         }
 
@@ -425,7 +440,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
 
         regs::set_dcp_pid(regs, DcpctrPid::_01, false);
         state.ep0_short_in_waiting_status = short_packet;
-        Ok(buf.len())
+        Ok(write_len)
     }
 
     fn read(&self, ep_addr: EndpointAddress, buf: &mut [u8]) -> UsbResult<usize> {
@@ -522,33 +537,78 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
     }
 
     fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
-        if ep_addr.index() != 0 {
+        if ep_addr.index() == 0 {
+            let regs = self.regs();
+            let live_ctsq = regs.intsts0().read().ctsq();
+            let next_pid = if stalled {
+                DcpctrPid::_10
+            } else if live_ctsq == Ctsq::_001 || live_ctsq == Ctsq::_010 {
+                DcpctrPid::_01
+            } else {
+                DcpctrPid::_00
+            };
+            let mut dcpctr = regs.dcpctr().read();
+            dcpctr.set_pid(next_pid);
+            dcpctr.set_sqclr(!stalled && next_pid != DcpctrPid::_01);
+            regs.dcpctr().write_value(dcpctr);
+
+            let mut state = self.state.borrow_mut();
+            if !stalled && next_pid == DcpctrPid::_01 && live_ctsq == Ctsq::_001 {
+                state.ep0_expect_status_out = true;
+            }
+            state.ep0_stalled = stalled;
             return;
         }
 
-        let regs = self.regs();
-        let live_ctsq = regs.intsts0().read().ctsq();
-        let next_pid = if stalled {
-            DcpctrPid::_10
-        } else if live_ctsq == Ctsq::_001 || live_ctsq == Ctsq::_010 {
-            DcpctrPid::_01
-        } else {
-            DcpctrPid::_00
+        let Some((pipe, binding)) = self.find_pipe(ep_addr) else {
+            return;
         };
-        let mut dcpctr = regs.dcpctr().read();
-        dcpctr.set_pid(next_pid);
-        dcpctr.set_sqclr(!stalled && next_pid != DcpctrPid::_01);
-        regs.dcpctr().write_value(dcpctr);
 
+        let regs = self.regs();
+        let bit = 1u16 << ep_addr.index();
         let mut state = self.state.borrow_mut();
-        if !stalled && next_pid == DcpctrPid::_01 && live_ctsq == Ctsq::_001 {
-            state.ep0_expect_status_out = true;
+
+        if stalled {
+            regs::set_pipe_pid(pipe, regs::PipePid::Stall);
+            match ep_addr.direction() {
+                UsbDirection::In => {
+                    state.stalled_in_mask |= bit;
+                    state.in_busy_mask &= !bit;
+                }
+                UsbDirection::Out => state.stalled_out_mask |= bit,
+            }
+            return;
         }
-        state.ep0_stalled = stalled;
+
+        regs::reset_pipe_control(pipe);
+        match ep_addr.direction() {
+            UsbDirection::In => {
+                state.stalled_in_mask &= !bit;
+                state.in_busy_mask &= !bit;
+            }
+            UsbDirection::Out => {
+                state.stalled_out_mask &= !bit;
+                self.start_out_receive_in_state(
+                    &mut state,
+                    pipe,
+                    binding.max_packet,
+                    binding.max_packet as u32,
+                );
+            }
+        }
     }
 
     fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
-        ep_addr.index() == 0 && self.state.borrow().ep0_stalled
+        if ep_addr.index() == 0 {
+            return self.state.borrow().ep0_stalled;
+        }
+
+        let bit = 1u16 << ep_addr.index();
+        let state = self.state.borrow();
+        match ep_addr.direction() {
+            UsbDirection::In => (state.stalled_in_mask & bit) != 0,
+            UsbDirection::Out => (state.stalled_out_mask & bit) != 0,
+        }
     }
 
     fn suspend(&self) {

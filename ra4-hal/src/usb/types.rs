@@ -113,6 +113,8 @@ pub struct BusState {
     pub allocated_in_mask: u16,
     pub allocated_out_mask: u16,
     pub ep0_stalled: bool,
+    pub stalled_in_mask: u16,
+    pub stalled_out_mask: u16,
     pub ep0_last_setup_dir_out: bool,
     pub ep0_setup_pending: bool,
     pub ep0_setup_ready: bool,

@@ -9,6 +9,7 @@
 
 use core::{
     cell::UnsafeCell,
+    mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
@@ -31,20 +32,25 @@ bind_interrupts!(struct Irqs {
     IEL5 => usb::InterruptHandler<USBFS>;
 });
 
-struct Shared<T>(UnsafeCell<T>);
-
-unsafe impl<T> Sync for Shared<T> {}
-
 type HalBus = usb::Bus<'static, USBFS>;
-type HalDevice = usb_device::device::UsbDevice<'static, HalBus>;
-type HalSerial = SerialPort<'static, HalBus>;
-
-static USB_BUS_ALLOC: Shared<Option<UsbBusAllocator<HalBus>>> = Shared(UnsafeCell::new(None));
-static USB_DEVICE: Shared<Option<HalDevice>> = Shared(UnsafeCell::new(None));
-static USB_SERIAL: Shared<Option<HalSerial>> = Shared(UnsafeCell::new(None));
 
 static USB_LAST_STATE: AtomicU8 = AtomicU8::new(0xff);
 static DTR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct StaticCell<T>(UnsafeCell<MaybeUninit<T>>);
+
+unsafe impl<T> Sync for StaticCell<T> {}
+
+fn init_usb_bus_allocator(bus: HalBus) -> &'static UsbBusAllocator<HalBus> {
+    static USB_BUS_ALLOC: StaticCell<UsbBusAllocator<HalBus>> =
+        StaticCell(UnsafeCell::new(MaybeUninit::uninit()));
+
+    unsafe {
+        let ptr = (*USB_BUS_ALLOC.0.get()).as_mut_ptr();
+        ptr.write(UsbBusAllocator::new(bus));
+        &*ptr
+    }
+}
 
 fn encode_state(state: UsbDeviceState) -> u8 {
     match state {
@@ -203,18 +209,12 @@ fn main() -> ! {
     )
     .unwrap();
     let bus = usb::Bus::new(driver);
-    unsafe {
-        *USB_BUS_ALLOC.0.get() = Some(UsbBusAllocator::new(bus));
-    }
+    let usb_bus = init_usb_bus_allocator(bus);
 
     boot_pause();
-    let usb_bus = unsafe { (&*USB_BUS_ALLOC.0.get()).as_ref().unwrap() };
-    let serial = SerialPort::new(usb_bus);
-    unsafe {
-        *USB_SERIAL.0.get() = Some(serial);
-    }
+    let mut serial = SerialPort::new(usb_bus);
 
-    let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x1209, 0x4d31))
+    let mut usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x1209, 0x4d31))
         .composite_with_iads()
         .max_packet_size_0(64)
         .unwrap()
@@ -225,20 +225,10 @@ fn main() -> ! {
         .unwrap()
         .build();
 
-    unsafe {
-        *USB_DEVICE.0.get() = Some(usb_dev);
-        (&*USB_DEVICE.0.get())
-            .as_ref()
-            .unwrap()
-            .bus()
-            .driver()
-            .enable_interrupts();
-        (&mut *USB_DEVICE.0.get())
-            .as_mut()
-            .unwrap()
-            .force_reset()
-            .expect("force reset must succeed");
-    }
+    usb_dev.bus().driver().enable_interrupts();
+    usb_dev
+        .force_reset()
+        .expect("force reset must succeed");
     attach_settle_pause();
 
     let mut last_state = UsbDeviceState::Default;
@@ -248,15 +238,9 @@ fn main() -> ! {
     let mut echo_off = 0usize;
 
     loop {
-        if let (Some(usb_dev), Some(serial)) =
-            (unsafe { (&mut *USB_DEVICE.0.get()).as_mut() }, unsafe {
-                (&mut *USB_SERIAL.0.get()).as_mut()
-            })
-        {
-            usb_dev.poll(&mut [serial]);
-            USB_LAST_STATE.store(encode_state(usb_dev.state()), Ordering::Relaxed);
-            DTR_ACTIVE.store(serial.dtr(), Ordering::Relaxed);
-        }
+        usb_dev.poll(&mut [&mut serial]);
+        USB_LAST_STATE.store(encode_state(usb_dev.state()), Ordering::Relaxed);
+        DTR_ACTIVE.store(serial.dtr(), Ordering::Relaxed);
 
         if let Some(state) = decode_state(USB_LAST_STATE.load(Ordering::Relaxed)) {
             if state != last_state {
@@ -271,32 +255,30 @@ fn main() -> ! {
             info!("dtr={}", dtr_active);
         }
 
-        if let Some(serial) = unsafe { (&mut *USB_SERIAL.0.get()).as_mut() } {
-            if echo_len == 0 {
-                if dtr_active {
-                    match serial.read(&mut echo_buf) {
-                        Ok(count) if count > 0 => {
-                            echo_len = count;
-                            echo_off = 0;
-                        }
-                        _ => {}
+        if echo_len == 0 {
+            if dtr_active {
+                match serial.read(&mut echo_buf) {
+                    Ok(count) if count > 0 => {
+                        echo_len = count;
+                        echo_off = 0;
                     }
+                    _ => {}
                 }
-            } else {
-                match serial.write(&echo_buf[echo_off..echo_len]) {
-                    Ok(written) if written > 0 => {
-                        echo_off += written;
-                        if echo_off == echo_len {
-                            echo_len = 0;
-                            echo_off = 0;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(usb_device::UsbError::WouldBlock) => {}
-                    Err(_) => {
+            }
+        } else {
+            match serial.write(&echo_buf[echo_off..echo_len]) {
+                Ok(written) if written > 0 => {
+                    echo_off += written;
+                    if echo_off == echo_len {
                         echo_len = 0;
                         echo_off = 0;
                     }
+                }
+                Ok(_) => {}
+                Err(usb_device::UsbError::WouldBlock) => {}
+                Err(_) => {
+                    echo_len = 0;
+                    echo_off = 0;
                 }
             }
         }

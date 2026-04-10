@@ -18,6 +18,7 @@ pub(super) const PIPE0_READY_ATTEMPTS: usize = 8;
 pub(super) enum PipePid {
     Nak,
     Buf,
+    Stall,
 }
 
 #[inline(always)]
@@ -327,6 +328,7 @@ pub(super) fn set_pipe_pid(pipe: u8, pid: PipePid) {
             ctr.set_pid(match pid {
                 PipePid::Nak => PipectrPid::_00,
                 PipePid::Buf => PipectrPid::_01,
+                PipePid::Stall => PipectrPid::_10,
             });
             regs.pipectr((pipe - 1) as usize).write_value(ctr);
         }
@@ -335,6 +337,7 @@ pub(super) fn set_pipe_pid(pipe: u8, pid: PipePid) {
             ctr.set_pid(match pid {
                 PipePid::Nak => Pipectr2Pid::_00,
                 PipePid::Buf => Pipectr2Pid::_01,
+                PipePid::Stall => Pipectr2Pid::_10,
             });
             regs.pipectr2((pipe - 6) as usize).write_value(ctr);
         }
@@ -415,7 +418,7 @@ pub(super) fn configure_pipe(
         _ => return,
     };
 
-    clear_pipe_config(regs, pipe);
+    clear_pipe_config(regs, brdyenb_shadow, nrdyenb_shadow, bempenb_shadow, pipe);
     regs.pipesel().write_value(Pipesel(pipe as u16));
     let mut pipecfg = Pipecfg::default();
     pipecfg.set_epnum(binding.ep_addr.index() as u8);
@@ -444,7 +447,18 @@ pub(super) fn configure_pipe(
     }
 }
 
-pub(super) fn clear_pipe_config(regs: pac::usbfs::Usbfs, pipe: u8) {
+pub(super) fn clear_pipe_config(
+    regs: pac::usbfs::Usbfs,
+    brdyenb_shadow: &mut u16,
+    nrdyenb_shadow: &mut u16,
+    bempenb_shadow: &mut u16,
+    pipe: u8,
+) {
+    let bit = 1u16 << pipe;
+    write_brdyenb(regs, brdyenb_shadow, *brdyenb_shadow & !bit);
+    write_nrdyenb(regs, nrdyenb_shadow, *nrdyenb_shadow & !bit);
+    write_bempenb(regs, bempenb_shadow, *bempenb_shadow & !bit);
+
     set_pipe_nak_wait(pipe);
     regs.pipesel().write_value(Pipesel(pipe as u16));
     regs.pipecfg().write_value(Pipecfg(0));
