@@ -9,7 +9,7 @@ use usb_device::{
 };
 
 use crate::pac::usbfs::regs::{Cfifosel, D0fifosel, D1fifosel, Dcpctr};
-use crate::pac::usbfs::vals::DcpctrPid;
+use crate::pac::usbfs::vals::{Ctsq, DcpctrPid, Dvsq};
 
 use super::types::{BusState, PipeBinding, UsbEventSnapshot};
 use super::{Driver, Instance, UsbIrqEvent, regs};
@@ -524,10 +524,10 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         }
 
         let regs = self.regs();
-        let live_ctsq = regs.intsts0().read().0 & regs::USB_CTSQ;
+        let live_ctsq = regs.intsts0().read().ctsq();
         let next_pid = if stalled {
             DcpctrPid::_10
-        } else if live_ctsq == regs::USB_CS_RDDS || live_ctsq == regs::USB_CS_RDSS {
+        } else if live_ctsq == Ctsq::_001 || live_ctsq == Ctsq::_010 {
             DcpctrPid::_01
         } else {
             DcpctrPid::_00
@@ -538,7 +538,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         regs.dcpctr().write_value(dcpctr);
 
         let mut state = self.state.borrow_mut();
-        if !stalled && next_pid == DcpctrPid::_01 && live_ctsq == regs::USB_CS_RDDS {
+        if !stalled && next_pid == DcpctrPid::_01 && live_ctsq == Ctsq::_001 {
             state.ep0_expect_status_out = true;
         }
         state.ep0_stalled = stalled;
@@ -568,7 +568,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
 
         if (intsts0 & regs::USB_DVST) != 0 {
             regs::clear_intsts0(regs, regs::USB_DVST);
-            if (intsts0 & regs::USB_DVSQ) == regs::USB_DS_DFLT {
+            if latched.intsts0.dvsq() == Dvsq::_001 {
                 return PollResult::Reset;
             }
         }
@@ -646,17 +646,14 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
             }
         }
 
-        let ctrt_ctsq = latched.ctrt_ctsq;
+        let ctrt_ctsq = Ctsq::from_bits(latched.ctrt_ctsq as u8);
         if (intsts0 & regs::USB_CTRT) != 0 {
             regs::clear_intsts0(regs, regs::USB_CTRT);
         }
 
         let queued_setup_ready = latched.setup_valid;
         let control_setup = !queued_setup_ready
-            && matches!(
-                ctrt_ctsq,
-                regs::USB_CS_RDDS | regs::USB_CS_WRDS | regs::USB_CS_WRND
-            );
+            && matches!(ctrt_ctsq, Ctsq::_001 | Ctsq::_011 | Ctsq::_101);
         let valid_setup = latched.valid_pending;
 
         let ep_setup = if control_setup || valid_setup || queued_setup_ready {
@@ -678,7 +675,7 @@ impl<'d, I: Instance + 'static> UsbBus for Bus<'d, I> {
         let mut ep_out = 0u16;
         if (brdysts & regs::USB_BRDY0) != 0 && ep_setup == 0 {
             ep_out |= 1;
-        } else if ctrt_ctsq == regs::USB_CS_RDSS {
+        } else if ctrt_ctsq == Ctsq::_010 {
             let mut state = self.state.borrow_mut();
             state.ep0_expect_status_out = false;
             state.ep0_short_in_waiting_status = false;
